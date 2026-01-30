@@ -86,6 +86,82 @@ class SlackBot:
         except SlackApiError as e:
             logger.error(f"Failed to update Slack message: {e}")
 
+    def open_edit_modal(self, trigger_id: str, request: ApprovalRequest):
+        """Open a modal for editing the email subject and body."""
+        try:
+            self.client.views_open(
+                trigger_id=trigger_id,
+                view={
+                    "type": "modal",
+                    "callback_id": "edit_email_modal",
+                    "private_metadata": request.id,
+                    "title": {
+                        "type": "plain_text",
+                        "text": "Edit Email"
+                    },
+                    "submit": {
+                        "type": "plain_text",
+                        "text": "Save"
+                    },
+                    "close": {
+                        "type": "plain_text",
+                        "text": "Cancel"
+                    },
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"*Company:* {request.company}\n*Contact:* {request.contact_name}"
+                            }
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "subject_block",
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "subject_input",
+                                "initial_value": request.personalized_subject,
+                                "placeholder": {
+                                    "type": "plain_text",
+                                    "text": "Email subject line"
+                                }
+                            },
+                            "label": {
+                                "type": "plain_text",
+                                "text": "Subject"
+                            }
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "body_block",
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "body_input",
+                                "multiline": True,
+                                "initial_value": request.personalized_email,
+                                "placeholder": {
+                                    "type": "plain_text",
+                                    "text": "Email body"
+                                }
+                            },
+                            "label": {
+                                "type": "plain_text",
+                                "text": "Email Body"
+                            }
+                        }
+                    ]
+                }
+            )
+        except SlackApiError as e:
+            logger.error(f"Failed to open edit modal: {e}")
+            raise
+
+    def refresh_approval_card(self, channel: str, ts: str, request: ApprovalRequest):
+        """Refresh the approval card with updated email content."""
+        blocks = self._build_approval_blocks(request)
+        self._update_message(channel, ts, blocks)
+
     def _build_approval_blocks(self, request: ApprovalRequest) -> list:
         """Build Slack Block Kit blocks for approval card."""
         return [

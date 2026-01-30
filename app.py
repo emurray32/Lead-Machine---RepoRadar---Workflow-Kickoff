@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify
 
 from config import config
 from schema import RepoRadarPayload, ApprovalRequest
-from storage import init_db, save_approval_request, get_approval_request, update_approval_status
+from storage import init_db, save_approval_request, get_approval_request, update_approval_status, update_approval_email
 from apollo_client import apollo_client
 from slack_bot import slack_bot
 from email_gen import generate_personalized_email, format_i18n_signals
@@ -140,7 +140,7 @@ def handle_reporadar_webhook():
 
 @app.route("/slack/interactions", methods=["POST"])
 def handle_slack_interactions():
-    """Handle Slack button interactions."""
+    """Handle Slack button interactions and modal submissions."""
 
     # Verify Slack signature
     if not verify_slack_signature(request):
@@ -151,12 +151,19 @@ def handle_slack_interactions():
         # Slack sends payload as form-encoded JSON string
         import json
         payload = json.loads(request.form.get("payload", "{}"))
+        payload_type = payload.get("type")
 
+        # Handle modal submissions
+        if payload_type == "view_submission":
+            return handle_modal_submission(payload)
+
+        # Handle button clicks
         action = payload.get("actions", [{}])[0]
         action_id = action.get("action_id")
         request_id = action.get("value")
         channel = payload.get("channel", {}).get("id")
         message_ts = payload.get("message", {}).get("ts")
+        trigger_id = payload.get("trigger_id")
 
         logger.info(f"Slack interaction: {action_id} for request {request_id}")
 
@@ -170,7 +177,7 @@ def handle_slack_interactions():
         elif action_id == "skip_lead":
             return handle_skip(approval_request, channel, message_ts)
         elif action_id == "edit_lead":
-            return handle_edit(approval_request)
+            return handle_edit(approval_request, trigger_id)
         elif action_id == "regenerate_lead":
             return handle_regenerate(approval_request, channel, message_ts)
         else:
@@ -178,6 +185,42 @@ def handle_slack_interactions():
 
     except Exception as e:
         logger.error(f"Error handling Slack interaction: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+def handle_modal_submission(payload: dict):
+    """Handle modal form submissions."""
+    try:
+        view = payload.get("view", {})
+        callback_id = view.get("callback_id")
+
+        if callback_id == "edit_email_modal":
+            request_id = view.get("private_metadata")
+            values = view.get("state", {}).get("values", {})
+
+            # Extract form values
+            new_subject = values.get("subject_block", {}).get("subject_input", {}).get("value", "")
+            new_body = values.get("body_block", {}).get("body_input", {}).get("value", "")
+
+            # Update in database
+            update_approval_email(request_id, new_subject, new_body)
+
+            # Get updated request and refresh the card
+            approval_request = get_approval_request(request_id)
+            if approval_request and approval_request.slack_message_ts:
+                slack_bot.refresh_approval_card(
+                    config.SLACK_CHANNEL_ID,
+                    approval_request.slack_message_ts,
+                    approval_request
+                )
+
+            logger.info(f"Updated email for request {request_id}")
+            return "", 200
+
+        return jsonify({"error": "Unknown modal"}), 400
+
+    except Exception as e:
+        logger.error(f"Error handling modal submission: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
@@ -231,16 +274,59 @@ def handle_skip(request: ApprovalRequest, channel: str, message_ts: str):
     return jsonify({"status": "skipped"}), 200
 
 
-def handle_edit(request: ApprovalRequest):
-    """Handle edit request - opens modal (placeholder)."""
-    # TODO: Implement modal for editing email
-    return jsonify({"status": "edit_not_implemented"}), 501
+def handle_edit(request: ApprovalRequest, trigger_id: str):
+    """Handle edit request - opens modal for editing email."""
+    try:
+        slack_bot.open_edit_modal(trigger_id, request)
+        return "", 200
+    except Exception as e:
+        logger.error(f"Error opening edit modal: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 def handle_regenerate(request: ApprovalRequest, channel: str, message_ts: str):
     """Handle regenerate request - regenerate email with AI."""
-    # TODO: Implement regeneration
-    return jsonify({"status": "regenerate_not_implemented"}), 501
+    try:
+        # Reconstruct the payload from stored data
+        from schema import RepoRadarPayload, ApolloContact
+
+        # Create a minimal payload for regeneration
+        payload = RepoRadarPayload(
+            company=request.company,
+            domain=request.domain,
+            signal_type="NEW_LANG_FILE",  # Default, actual type stored in i18n_signals
+            signal_summary=request.signal_summary
+        )
+
+        # Create contact object
+        name_parts = request.contact_name.split(" ", 1)
+        contact = ApolloContact(
+            id=request.contact_id,
+            first_name=name_parts[0],
+            last_name=name_parts[1] if len(name_parts) > 1 else None,
+            name=request.contact_name,
+            title=request.contact_title,
+            email=request.contact_email,
+            organization_name=request.company
+        )
+
+        # Regenerate the email
+        new_subject, new_body = generate_personalized_email(payload, contact)
+
+        # Update in database
+        update_approval_email(request.id, new_subject, new_body)
+
+        # Get updated request and refresh the card
+        updated_request = get_approval_request(request.id)
+        if updated_request:
+            slack_bot.refresh_approval_card(channel, message_ts, updated_request)
+
+        logger.info(f"Regenerated email for request {request.id}")
+        return jsonify({"status": "regenerated"}), 200
+
+    except Exception as e:
+        logger.error(f"Error regenerating email: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":

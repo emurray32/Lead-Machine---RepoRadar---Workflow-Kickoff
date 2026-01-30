@@ -191,3 +191,17 @@ def get_pending_requests() -> list[ApprovalRequest]:
         )
         rows = cursor.fetchall()
         return [ApprovalRequest(**dict(row)) for row in rows]
+
+
+def update_approval_email(request_id: str, subject: str, body: str):
+    """Update the personalized email content for an approval request."""
+    with db_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE approval_queue
+            SET personalized_subject = ?, personalized_email = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (subject, body, datetime.now().isoformat(), request_id)
+        )
